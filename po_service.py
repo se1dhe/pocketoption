@@ -9,10 +9,11 @@ import json
 import os
 from aiohttp import web
 import logging
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Cache
@@ -20,12 +21,26 @@ candles_cache = {}
 balance_cache = {"amount": None, "currency": "USD", "updated_at": None}
 po_client = None
 client_connected = False
+last_warning_at = {}
 
-SSID = os.environ.get("POCKET_OPTION_SSID", "")
+SSID = os.environ.get("POCKET_OPTION_SSID", "").strip().strip('"').strip("'")
+PO_UID = int(os.environ.get("POCKET_OPTION_UID", "0") or "0")
+PO_IS_DEMO = os.environ.get("POCKET_OPTION_IS_DEMO", "true").lower() in {"1", "true", "yes", "y"}
+WARN_THROTTLE_SECONDS = int(os.environ.get("PO_SERVICE_WARN_THROTTLE_SECONDS", "60") or "60")
+
+
+def throttled_warning(key: str, message: str) -> None:
+    """Log noisy warnings no more than once per key per throttle window."""
+    now = datetime.utcnow().timestamp()
+    previous = last_warning_at.get(key, 0)
+    if now - previous >= WARN_THROTTLE_SECONDS:
+        last_warning_at[key] = now
+        logger.warning(message)
+
 
 async def init_po_client():
     """Initialize real PocketOption client with SSID"""
-    global po_client, client_connected
+    global po_client, client_connected, PO_UID, PO_IS_DEMO
     if not SSID:
         logger.warning("[PO_SERVICE] No SSID found — balance will be unavailable")
         return
@@ -33,19 +48,20 @@ async def init_po_client():
     try:
         from pocketoptionapi_async import AsyncPocketOptionClient
 
-        # Parse SSID to get uid and isDemo
-        ssid_str = SSID.strip()
-        uid = 0
-        is_demo = True
+        ssid_str = SSID
+        uid = PO_UID
+        is_demo = PO_IS_DEMO
 
         try:
             parsed = json.loads(ssid_str)
             if isinstance(parsed, list) and len(parsed) >= 2 and parsed[0] == "auth":
-                uid = parsed[1].get("uid", 0)
+                uid = int(parsed[1].get("uid", uid) or 0)
                 is_demo = parsed[1].get("isDemo", 1) == 1
-                logger.info(f"[PO_SERVICE] SSID parsed: uid={uid}, isDemo={is_demo}")
-        except Exception as e:
-            logger.warning(f"[PO_SERVICE] Could not parse SSID JSON: {e}")
+                logger.info(f"[PO_SERVICE] SSID parsed as auth JSON: uid={uid}, isDemo={is_demo}")
+            else:
+                logger.info(f"[PO_SERVICE] Raw SSID token detected: uid={uid}, isDemo={is_demo}")
+        except Exception:
+            logger.info(f"[PO_SERVICE] Raw SSID token detected: uid={uid}, isDemo={is_demo}")
 
         po_client = AsyncPocketOptionClient(
             ssid=ssid_str,
@@ -61,8 +77,9 @@ async def init_po_client():
         connected = await asyncio.wait_for(po_client.connect(), timeout=20)
         if connected:
             client_connected = True
+            PO_UID = uid
+            PO_IS_DEMO = is_demo
             logger.info("[PO_SERVICE] ✅ Connected to PocketOption!")
-            # Fetch initial balance
             await refresh_balance()
         else:
             logger.warning("[PO_SERVICE] ⚠️ Could not connect to PocketOption — using offline mode")
@@ -70,6 +87,7 @@ async def init_po_client():
         logger.warning("[PO_SERVICE] ⚠️ Connection timeout — using offline mode")
     except Exception as e:
         logger.warning(f"[PO_SERVICE] ⚠️ PocketOption init failed: {e} — using offline mode")
+
 
 async def refresh_balance():
     """Fetch balance from PocketOption"""
@@ -83,7 +101,8 @@ async def refresh_balance():
             balance_cache["updated_at"] = datetime.utcnow().isoformat()
             logger.info(f"[PO_SERVICE] Balance: ${balance_cache['amount']:.2f}")
     except Exception as e:
-        logger.warning(f"[PO_SERVICE] Balance fetch error: {e}")
+        throttled_warning("balance", f"[PO_SERVICE] Balance fetch error: {e}")
+
 
 async def balance_refresh_loop():
     """Refresh balance every 30 seconds"""
@@ -102,6 +121,7 @@ async def handle_balance(request):
         "updated_at": balance_cache["updated_at"]
     })
 
+
 async def handle_candles(request):
     """HTTP endpoint to fetch candles"""
     try:
@@ -115,10 +135,8 @@ async def handle_candles(request):
 
         cache_key = f"{asset}/{timeframe}"
         if cache_key in candles_cache:
-            logger.info(f"[PO_SERVICE] Returning cached candles for {asset}/{timeframe}")
             return web.json_response({"success": True, "candles": candles_cache[cache_key]})
 
-        # Try real data if connected
         if po_client and client_connected:
             try:
                 real_candles = await asyncio.wait_for(
@@ -140,28 +158,36 @@ async def handle_candles(request):
                     logger.info(f"[PO_SERVICE] Real candles fetched for {asset}/{timeframe}")
                     return web.json_response({"success": True, "candles": formatted})
             except Exception as e:
-                logger.warning(f"[PO_SERVICE] Real candle fetch failed for {asset}: {e}")
+                throttled_warning(
+                    f"fetch_failed:{cache_key}",
+                    f"[PO_SERVICE] Real candle fetch failed for {asset}/{timeframe}: {e}"
+                )
 
-        # No fake fallback — only real exchange data is served
-        logger.warning(f"[PO_SERVICE] No real candles available for {asset}/{timeframe} — exchange not connected")
+        throttled_warning(
+            f"unavailable:{cache_key}",
+            f"[PO_SERVICE] No real candles available for {asset}/{timeframe} — exchange not connected"
+        )
         return web.json_response({"success": False, "candles": [], "reason": "exchange_unavailable"})
 
     except Exception as e:
         logger.error(f"[PO_SERVICE] Handler error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+
 async def handle_status(request):
     """HTTP endpoint for service status"""
     return web.json_response({
         "status": "ready",
         "connected": client_connected,
+        "uid": PO_UID,
+        "is_demo": PO_IS_DEMO,
         "cache_size": len(candles_cache),
         "balance": balance_cache["amount"]
     })
 
+
 async def main():
     """Main service runner"""
-    # Init PocketOption client in background
     asyncio.create_task(init_po_client())
 
     app = web.Application()
@@ -169,7 +195,7 @@ async def main():
     app.router.add_get('/api/balance', handle_balance)
     app.router.add_get('/api/status', handle_status)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 5001)
     await site.start()
@@ -179,7 +205,6 @@ async def main():
     logger.info("[PO_SERVICE] GET /api/balance  - Fetch real account balance")
     logger.info("[PO_SERVICE] GET /api/status   - Service status")
 
-    # Start balance refresh loop
     asyncio.create_task(balance_refresh_loop())
 
     try:
@@ -189,6 +214,7 @@ async def main():
         if po_client:
             await po_client.disconnect()
         await runner.cleanup()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
