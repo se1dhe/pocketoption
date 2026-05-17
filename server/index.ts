@@ -16,7 +16,7 @@ function log(message: string, source = "express") {
 }
 
 function serveStaticProduction(app: any) {
-  const distPath = path.resolve(import.meta.dirname, "../client/dist");
+  const distPath = path.resolve(import.meta.dirname, "public");
   
   if (!fs.existsSync(distPath)) {
     // In development, vite handles serving. In production, client must be built first.
@@ -127,7 +127,7 @@ function startPythonService() {
   });
 
   // Serve frontend
-  const distPath = path.resolve(import.meta.dirname, "../client/dist");
+  const distPath = path.resolve(import.meta.dirname, "public");
   
   // Production mode: always serve static files (vite NOT bundled)
   if (process.env.NODE_ENV === "production") {
